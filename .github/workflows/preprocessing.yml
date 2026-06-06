@@ -6,6 +6,7 @@ on:
     paths:
       - 'FD001_raw/**'
       - 'preprocessing/automate_Amr.py'
+  workflow_dispatch:
 
 jobs:
   preprocess:
