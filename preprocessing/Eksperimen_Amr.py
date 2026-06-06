@@ -223,6 +223,7 @@ for i, op in enumerate(op_cols, 1):
 plt.tight_layout()
 plt.show()
 
+
 for op in op_cols:
     print(f"Unique values/Stats for {op}:")
     print(train_df[op].describe())
@@ -231,3 +232,165 @@ for op in op_cols:
 # %% [markdown]
 # **Temuan:**
 # - Untuk dataset FD001, operational settings hampir konstan (hanya ada variasi kecil pada `op_1` dan `op_2`, sedangkan `op_3` adalah konstan 100.0). Hal ini mengonfirmasi bahwa FD001 beroperasi pada kondisi tunggal (single operating condition).
+
+# %% [markdown]
+# # CMAPSS RUL Prediction - Fase 3: Preprocessing & Output Dataset
+# In this phase, we perform data transformation: dropping non-informative sensors, deriving the RUL target column, engineering rolling statistics features, scaling, preparing test labels, and exporting the results to CSV files.
+
+# %%
+from sklearn.preprocessing import MinMaxScaler
+
+# %% [markdown]
+# ## Step 1 — Drop Constant/Non-informative Sensors
+# Based on descriptive statistics in EDA, we drop sensors: s1, s5, s6, s10, s16, s18, s19.
+
+# %%
+SENSOR_COLS_TO_DROP = ['s1', 's5', 's6', 's10', 's16', 's18', 's19']
+train_processed = train_df.drop(columns=SENSOR_COLS_TO_DROP)
+test_processed = test_df.drop(columns=SENSOR_COLS_TO_DROP)
+
+# Remaining sensor columns
+remaining_sensors = [col for col in train_processed.columns if col.startswith('s')]
+print(f"Remaining sensors: {remaining_sensors}")
+
+# %% [markdown]
+# ## Step 2 — Derive RUL target for Training Set
+# We calculate the RUL (Remaining Useful Life) for the train set based on the maximum cycle for each engine.
+
+# %%
+# Calculate max cycle per unit
+max_cycles = train_processed.groupby('unit_nr')['time_cycles'].max()
+train_processed = train_processed.merge(max_cycles.rename('max_cycle'), on='unit_nr')
+train_processed['RUL'] = train_processed['max_cycle'] - train_processed['time_cycles']
+train_processed.drop(columns=['max_cycle'], inplace=True)
+
+print("Sample RUL derivation:")
+print(train_processed[['unit_nr', 'time_cycles', 'RUL']].head())
+
+# %% [markdown]
+# ## Step 3 — Clipping RUL
+# We clip the RUL at 125 based on the piecewise linear model justification.
+
+# %%
+RUL_CLIP = 125
+train_processed['RUL'] = train_processed['RUL'].clip(upper=RUL_CLIP)
+
+print("\nSample clipped RUL:")
+print(train_processed[['unit_nr', 'time_cycles', 'RUL']].head())
+
+# %% [markdown]
+# ## Step 4 — Feature Engineering: Rolling Features
+# We compute rolling mean and rolling std with window sizes of 5 and 10 for each informative sensor per unit.
+# Any NaN values arising at the beginning of the window will be dropped to ensure clean datasets.
+
+# %%
+def add_rolling_features(df, sensor_cols, windows=[5, 10]):
+    features_df = df.copy()
+    
+    # We will compute rolling features grouped by unit_nr
+    for window in windows:
+        # Rolling mean
+        rolling_mean = df.groupby('unit_nr')[sensor_cols].rolling(window=window).mean().reset_index(level=0, drop=True)
+        rolling_mean.columns = [f"{col}_roll_mean_{window}" for col in sensor_cols]
+        
+        # Rolling std
+        rolling_std = df.groupby('unit_nr')[sensor_cols].rolling(window=window).std().reset_index(level=0, drop=True)
+        rolling_std.columns = [f"{col}_roll_std_{window}" for col in sensor_cols]
+        
+        # Merge into the dataframe
+        features_df = pd.concat([features_df, rolling_mean, rolling_std], axis=1)
+        
+    return features_df
+
+# Apply rolling features
+train_processed = add_rolling_features(train_processed, remaining_sensors)
+test_processed = add_rolling_features(test_processed, remaining_sensors)
+
+# Drop any rows containing NaN values due to the rolling window calculation
+train_processed.dropna(inplace=True)
+test_processed.dropna(inplace=True)
+
+# Reset index
+train_processed.reset_index(drop=True, inplace=True)
+test_processed.reset_index(drop=True, inplace=True)
+
+print(f"Shape of Train with rolling features (after dropping NaNs): {train_processed.shape}")
+print(f"Shape of Test with rolling features (after dropping NaNs): {test_processed.shape}")
+
+# %% [markdown]
+# ## Step 5 — Normalization using MinMaxScaler
+# We fit the MinMaxScaler ONLY on the train set (to avoid data leakage) and then transform both train and test.
+# Note: We scale the features (op_1, op_2, op_3, and remaining sensors/rolling features). We do not scale unit_nr, time_cycles, and RUL.
+
+# %%
+# Identify features to scale
+exclude_cols = ['unit_nr', 'time_cycles', 'RUL']
+feature_cols = [col for col in train_processed.columns if col not in exclude_cols]
+
+scaler = MinMaxScaler()
+
+# Fit scaler on train features and transform both
+train_processed[feature_cols] = scaler.fit_transform(train_processed[feature_cols])
+test_processed[feature_cols] = scaler.transform(test_processed[feature_cols])
+
+print("Sample scaled training features:")
+print(train_processed[feature_cols].head())
+
+# %% [markdown]
+# ## Step 6 — Prepare Test Labels (Ground Truth RUL)
+# For the test set, the ground truth RUL values are given in RUL_FD001.txt, representing the final RUL of each engine at the end of its recorded sequence.
+# We will associate the ground truth RUL with the last available time cycle of each unit in the test set.
+
+# %%
+# Keep only the last cycle for each engine in the test set
+test_last_cycle = test_processed.groupby('unit_nr').last().reset_index()
+
+# Add a 1-based index to match the 1-based RUL txt file rows
+rul_df['unit_nr'] = rul_df.index + 1
+
+# Merge the ground truth RUL onto the test set's last cycle
+test_final = test_last_cycle.merge(rul_df, on='unit_nr')
+
+print("Final test dataframe structure with ground truth RUL:")
+print(test_final[['unit_nr', 'time_cycles', 'RUL']].head())
+
+# %% [markdown]
+# ## Step 7 — Export Dataset
+# We export the preprocessed train set and final test set with RUL labels.
+
+# %%
+# Create preprocessing output directory
+OUTPUT_DIR = "FD001_preprocessing"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+TRAIN_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "FD001_preprocessing_train.csv")
+TEST_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "FD001_preprocessing_test.csv")
+
+# Export to CSV
+train_processed.to_csv(TRAIN_OUTPUT_PATH, index=False)
+test_final.to_csv(TEST_OUTPUT_PATH, index=False)
+
+print(f"Train dataset exported to: {TRAIN_OUTPUT_PATH}")
+print(f"Test dataset exported to: {TEST_OUTPUT_PATH}")
+
+# %% [markdown]
+# ## Final Verification Checks
+# Checking if output CSV files exist, are not empty, and contain no NaN values.
+
+# %%
+print(f"Train output file exists: {os.path.exists(TRAIN_OUTPUT_PATH)}")
+print(f"Test output file exists: {os.path.exists(TEST_OUTPUT_PATH)}")
+
+# Load the files back to verify
+verify_train = pd.read_csv(TRAIN_OUTPUT_PATH)
+verify_test = pd.read_csv(TEST_OUTPUT_PATH)
+
+print(f"Verify Train shape: {verify_train.shape}")
+print(f"Verify Test shape: {verify_test.shape}")
+print(f"Total NaNs in exported Train: {verify_train.isnull().sum().sum()}")
+print(f"Total NaNs in exported Test: {verify_test.isnull().sum().sum()}")
+
+assert verify_train.isnull().sum().sum() == 0, "Error: NaNs found in exported Train set!"
+assert verify_test.isnull().sum().sum() == 0, "Error: NaNs found in exported Test set!"
+print("Verification successful! Preprocessed datasets are clean and ready.")
+
