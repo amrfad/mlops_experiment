@@ -1,0 +1,33 @@
+name: Automated Preprocessing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'FD001_raw/**'
+      - 'preprocessing/automate_Amr.py'
+
+jobs:
+  preprocess:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12.7'
+
+      - name: Install dependencies
+        run: pip install pandas numpy scikit-learn
+
+      - name: Run preprocessing
+        run: python preprocessing/automate_Amr.py
+
+      - name: Commit preprocessed dataset
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add preprocessing/FD001_preprocessing/
+          git commit -m "auto: update preprocessed dataset [skip ci]" || echo "No changes"
+          git push
